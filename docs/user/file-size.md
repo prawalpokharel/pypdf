@@ -88,6 +88,25 @@ and supports the `level` parameter: `level=0` means no compression,
 Using this method, we have seen a reduction by 70% (from 11.8 MB to 3.5 MB)
 with a real PDF.
 
+## Object Streams
+
+Since PDF 1.5, objects that are not streams, such as page dictionaries, font
+dictionaries, annotations, outline items and form fields, can be stored together in
+compressed object streams. pypdf writes them when `object_streams` is set to `True`:
+
+```{testcode}
+from pypdf import PdfWriter
+
+writer = PdfWriter(clone_from="example.pdf")
+writer.object_streams = True
+
+writer.write("out-object-streams.pdf")
+```
+
+This is lossless as well: the content of the document is the same. As object
+streams need PDF 1.5, the file gets at least a `%PDF-1.5` header. The setting has
+no effect in incremental mode.
+
 ## Removing Sources
 
 When a page is removed from the page list, its content will still be present in

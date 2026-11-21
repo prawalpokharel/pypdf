@@ -89,6 +89,7 @@ from .generic import (
     BooleanObject,
     ByteStringObject,
     ContentStream,
+    DecodedStreamObject,
     Destination,
     DictionaryObject,
     EmbeddedFile,
@@ -292,6 +293,14 @@ class PdfWriter(PdfDocCommon):
         """
 
         self.incremental = incremental or full
+
+        self.object_streams = False
+        """
+        If true, ``write`` stores all objects except streams and the encryption dictionary
+        in compressed object streams and writes a cross-reference stream (PDF 1.5). This
+        usually makes the file smaller without changing its content. It has no effect in
+        incremental mode.
+        """
 
         self._objects = []
 
@@ -1487,6 +1496,8 @@ class PdfWriter(PdfDocCommon):
             stream.write(self._reader.stream.read(-1))
             if has_increment:
                 self._write_increment(stream)  # writes objs, xref stream and startxref
+        elif self.object_streams:
+            self._write_with_object_streams(stream)
         else:
             object_positions, free_objects = self._write_pdf_structure(stream)
             xref_location = self._write_xref_table(
@@ -1666,9 +1677,14 @@ class PdfWriter(PdfDocCommon):
             of certain special objects within the body of the file.
         """
         stream.write(b"trailer\n")
+        self._get_trailer_entries(len(self._objects) + 1).write_to_stream(stream)
+        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+
+    def _get_trailer_entries(self, size: int) -> DictionaryObject:
+        """The entries of the trailer. A cross-reference stream contains them as well."""
         trailer = DictionaryObject(
             {
-                NameObject(TrailerKeys.SIZE): NumberObject(len(self._objects) + 1),
+                NameObject(TrailerKeys.SIZE): NumberObject(size),
                 NameObject(TrailerKeys.ROOT): self.root_object.indirect_reference,
             }
         )
@@ -1678,8 +1694,96 @@ class PdfWriter(PdfDocCommon):
             trailer[NameObject(TrailerKeys.ID)] = self._ID
         if self._encrypt_entry:
             trailer[NameObject(TrailerKeys.ENCRYPT)] = self._encrypt_entry.indirect_reference
-        trailer.write_to_stream(stream)
-        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+        return trailer
+
+    def _write_with_object_streams(self, stream: StreamType) -> None:
+        """
+        Write the whole document with object streams and a cross-reference stream.
+
+        Streams and the encryption dictionary are written as indirect objects, as in
+        the normal path. All other objects go into compressed object streams
+        (ISO 32000-1, 7.5.7) of at most 100 objects. The cross-reference stream
+        (ISO 32000-1, 7.5.8) replaces the cross-reference table and the trailer.
+
+        In an encrypted document, each object stream is encrypted as a whole, and
+        the strings inside it are not encrypted separately.
+        """
+        header = _get_max_pdf_version_header(self.pdf_header, "%PDF-1.5")
+        stream.write(header.encode() + b"\n")
+        stream.write(b"%\xE2\xE3\xCF\xD3\n")
+
+        # entries[idnum] = (type, field 2, field 3) of the cross-reference stream
+        entries: dict[int, tuple[int, int, int]] = {}
+        free_objects = []
+        compressed: list[tuple[int, PdfObject]] = []
+        for idnum, obj in enumerate(self._objects, start=1):
+            if obj is None:
+                free_objects.append(idnum)
+            elif isinstance(obj, StreamObject) or obj is self._encrypt_entry:
+                written = cast(PdfObject, obj)
+                entries[idnum] = (1, stream.tell(), 0)
+                stream.write(f"{idnum} 0 obj\n".encode())
+                if self._encryption and written is not self._encrypt_entry:
+                    written = self._encryption.encrypt_object(written, idnum, 0)
+                written.write_to_stream(stream)
+                stream.write(b"\nendobj\n")
+            else:
+                compressed.append((idnum, obj))
+
+        objects_per_stream = 100  # as in qpdf
+        next_idnum = len(self._objects) + 1
+        for start in range(0, len(compressed), objects_per_stream):
+            chunk = compressed[start:start + objects_per_stream]
+            offsets = []
+            body = BytesIO()
+            for index, (idnum, obj) in enumerate(chunk):
+                offsets.append(f"{idnum} {body.tell()}")
+                obj.write_to_stream(body)
+                body.write(b"\n")
+                entries[idnum] = (2, next_idnum, index)
+            first = (" ".join(offsets) + "\n").encode()
+            object_stream = DecodedStreamObject()
+            object_stream[NameObject("/Type")] = NameObject("/ObjStm")
+            object_stream[NameObject("/N")] = NumberObject(len(chunk))
+            object_stream[NameObject("/First")] = NumberObject(len(first))
+            object_stream.set_data(first + body.getvalue())
+            encoded: PdfObject = object_stream.flate_encode()
+            if self._encryption:
+                encoded = self._encryption.encrypt_object(encoded, next_idnum, 0)
+            entries[next_idnum] = (1, stream.tell(), 0)
+            stream.write(f"{next_idnum} 0 obj\n".encode())
+            encoded.write_to_stream(stream)
+            stream.write(b"\nendobj\n")
+            next_idnum += 1
+
+        # Free objects are chained from object 0, as in the cross-reference table.
+        free_chain = [*free_objects, 0]
+        entries[0] = (0, free_chain[0], 65535)
+        for idnum, next_free in zip(free_objects, free_chain[1:]):
+            entries[idnum] = (0, next_free, 1)
+        xref_idnum = next_idnum
+        xref_location = stream.tell()
+        entries[xref_idnum] = (1, xref_location, 0)
+
+        widths = [
+            1,
+            max(1, (max(entry[1] for entry in entries.values()).bit_length() + 7) // 8),
+            max(1, (max(entry[2] for entry in entries.values()).bit_length() + 7) // 8),
+        ]
+        xref_stream = DecodedStreamObject()
+        xref_stream[NameObject("/Type")] = NameObject("/XRef")
+        xref_stream.update(self._get_trailer_entries(xref_idnum + 1))
+        xref_stream[NameObject("/W")] = ArrayObject(NumberObject(width) for width in widths)
+        xref_stream.set_data(
+            b"".join(
+                b"".join(value.to_bytes(width, "big") for value, width in zip(entries[idnum], widths))
+                for idnum in range(xref_idnum + 1)
+            )
+        )
+        # The cross-reference stream is never encrypted (ISO 32000-1, 7.5.8.2).
+        stream.write(f"{xref_idnum} 0 obj\n".encode())
+        xref_stream.flate_encode().write_to_stream(stream)
+        stream.write(f"\nendobj\nstartxref\n{xref_location}\n%%EOF\n".encode())
 
     @property
     def metadata(self) -> DocumentInformation | None:

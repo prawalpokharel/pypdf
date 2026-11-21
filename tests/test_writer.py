@@ -4248,6 +4248,116 @@ def test_write__incremental__encrypted_source():
     assert output.getvalue() == b""
 
 
+def test_write__object_streams():
+    """With object_streams, the objects that are not streams are stored in object streams."""
+    source = RESOURCE_ROOT / "pdflatex-outline.pdf"
+    plain = BytesIO()
+    PdfWriter(clone_from=source).write(plain)
+    writer = PdfWriter(clone_from=source)
+    writer.object_streams = True
+    compact = BytesIO()
+    writer.write(compact)
+
+    assert compact.getvalue().startswith(b"%PDF-1.5\n")
+    assert b"\nxref\n" not in compact.getvalue()
+    assert len(compact.getvalue()) < len(plain.getvalue())
+    reader = PdfReader(compact)
+    reference = PdfReader(plain)
+    assert len(reader.xref_objStm) > 0
+    assert [page.extract_text() for page in reader.pages] == [page.extract_text() for page in reference.pages]
+    assert [item.title for item in reader.outline if not isinstance(item, list)] == [
+        item.title for item in reference.outline if not isinstance(item, list)
+    ]
+    assert reader.metadata == reference.metadata
+
+
+def test_write__object_streams__free_objects():
+    """Free object numbers stay free in the cross-reference stream."""
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "pdflatex-outline.pdf")
+    writer.remove_page(0)
+    writer.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
+    free = [idnum for idnum, obj in enumerate(writer._objects, start=1) if obj is None]
+    assert free
+    writer.object_streams = True
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    assert len(reader.pages) == 3
+    assert len(reader.xref_objStm) > 0
+    for idnum in free:
+        assert idnum not in reader.xref[0]
+        assert idnum not in reader.xref_objStm
+
+    # The free entries are chained from object 0 back to object 0. pypdf skips
+    # free entries when reading, so decode the cross-reference stream here.
+    xref_stream = reader.get_object(reader.trailer["/Size"] - 1)
+    assert xref_stream["/Type"] == "/XRef"
+    widths = xref_stream["/W"]
+    data = xref_stream.get_data()
+    entries = []
+    for row in range(0, len(data), sum(widths)):
+        fields, position = [], row
+        for width in widths:
+            fields.append(int.from_bytes(data[position:position + width], "big"))
+            position += width
+        entries.append(fields)
+    assert entries[0] == [0, free[0], 65535]
+    assert [entries[idnum] for idnum in free] == [[0, next_free, 1] for next_free in [*free[1:], 0]]
+
+
+def test_write__object_streams__several_streams():
+    """More than 100 objects are split over several object streams."""
+    writer = PdfWriter()
+    for _ in range(250):
+        writer.add_blank_page(width=72, height=72)
+    compressed = [
+        idnum for idnum, obj in enumerate(writer._objects, start=1)
+        if obj is not None and not isinstance(obj, StreamObject)
+    ]
+    assert len(compressed) > 200
+    writer.object_streams = True
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    assert sorted(reader.xref_objStm) == compressed
+    assert len({stream_id for stream_id, _ in reader.xref_objStm.values()}) == (len(compressed) + 99) // 100
+    assert len(reader.pages) == 250
+    assert all(page.mediabox.width == 72 for page in reader.pages)
+
+
+def test_write__object_streams__incremental():
+    """In incremental mode, object_streams has no effect."""
+    source = RESOURCE_ROOT / "crazyones.pdf"
+    original = source.read_bytes()
+    writer = PdfWriter(source, incremental=True)
+    writer.object_streams = True
+    writer.add_metadata({"/Title": "Changed title"})
+    output = BytesIO()
+    writer.write(output)
+
+    assert output.getvalue().startswith(original)
+    assert b"/ObjStm" not in output.getvalue()[len(original):]
+    assert PdfReader(output).metadata.title == "Changed title"
+
+
+def test_write__object_streams__without_info_and_id():
+    """A new document without /Info and /ID gets neither entry in the cross-reference stream."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.metadata = None
+    writer.object_streams = True
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    assert len(reader.xref_objStm) > 0
+    assert len(reader.pages) == 1
+    assert reader.metadata is None
+    assert "/ID" not in reader.trailer
+
+
 @pytest.mark.timeout(5)
 def test_get_filtered_outline__first__cyclic(caplog) -> None:
     writer = PdfWriter()

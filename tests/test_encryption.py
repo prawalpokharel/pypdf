@@ -943,3 +943,26 @@ def test_encrypt__empty_owner_password_uses_user_password():
     reader = PdfReader(output)
     assert reader.decrypt("userpwd") == PasswordType.OWNER_PASSWORD
     assert len(reader.pages) == 1
+
+
+@pytest.mark.parametrize(("algorithm", "requires_aes"), [("RC4-128", False), ("AES-256", True)])
+def test_write__object_streams__encrypted(algorithm, requires_aes):
+    """The object streams of an encrypted document are encrypted as a whole."""
+    if requires_aes and not HAS_AES:
+        pytest.skip("No AES implementation")
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.add_metadata({"/Title": "Secret title"})
+    writer.object_streams = True
+    writer.encrypt("user", "owner", algorithm=algorithm)
+    output = BytesIO()
+    writer.write(output)
+    data = output.getvalue()
+
+    # pypdf decrypts the object streams themselves, so this only works if they
+    # were encrypted.
+    for password, password_type in (("user", PasswordType.USER_PASSWORD), ("owner", PasswordType.OWNER_PASSWORD)):
+        reader = PdfReader(BytesIO(data))
+        assert reader.decrypt(password) == password_type
+        assert len(reader.xref_objStm) > 0
+        assert reader.metadata.title == "Secret title"
+        assert "The Crazy Ones" in reader.pages[0].extract_text()
