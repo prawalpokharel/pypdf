@@ -16,8 +16,10 @@ from pypdf import PasswordType, PdfReader, PdfWriter
 from pypdf._crypt_providers import crypt_provider
 from pypdf._crypt_providers._fallback import _DEPENDENCY_ERROR_STR
 from pypdf._encryption import AlgV5, CryptAES, CryptRC4, EncryptAlgorithm, Encryption, _saslprep
+from pypdf.annotations import FreeText
 from pypdf.errors import DependencyError, PdfReadError, PdfStreamError, WrongPasswordError
-from pypdf.generic import ByteStringObject, DictionaryObject, NameObject, NullObject, NumberObject
+from pypdf.generic import ByteStringObject, DictionaryObject, IndirectObject, NameObject, NullObject, NumberObject
+from pypdf.xmp import XmpInformation
 from tests import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url
 
 USE_CRYPTOGRAPHY = crypt_provider[0] == "cryptography"
@@ -943,3 +945,90 @@ def test_encrypt__empty_owner_password_uses_user_password():
     reader = PdfReader(output)
     assert reader.decrypt("userpwd") == PasswordType.OWNER_PASSWORD
     assert len(reader.pages) == 1
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "requires_aes"),
+    [
+        ("RC4-40", False),
+        ("RC4-128", False),
+        ("AES-128", True),
+        ("AES-256-R5", True),
+        ("AES-256", True),
+    ],
+)
+def test_write__incremental__encrypted_update(algorithm, requires_aes):
+    """Changes to an encrypted document are appended, encrypted with the key of the document."""
+    if requires_aes and not HAS_AES:
+        pytest.skip("No AES implementation")
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.encrypt("user", "owner", algorithm=algorithm)
+    source = BytesIO()
+    writer.write(source)
+    original = source.getvalue()
+
+    writer = PdfWriter(PdfReader(BytesIO(original), password="user"), incremental=True)
+    writer.add_metadata({"/Title": "Secret title"})
+    writer.add_annotation(0, FreeText(text="Secret note", rect=(10, 10, 200, 40)))
+    output = BytesIO()
+    writer.write(output)
+    data = output.getvalue()
+
+    assert data.startswith(original)
+    assert b"Secret title" not in data
+    assert b"Secret note" not in data
+    for password, password_type in (("user", PasswordType.USER_PASSWORD), ("owner", PasswordType.OWNER_PASSWORD)):
+        reader = PdfReader(BytesIO(data))
+        assert reader.decrypt(password) == password_type
+        assert reader.metadata.title == "Secret title"
+        notes = [annotation.get_object()["/Contents"] for annotation in reader.pages[0]["/Annots"]]
+        assert "Secret note" in notes
+
+
+@pytest.mark.skipif(not HAS_AES, reason="No AES implementation")
+def test_write__incremental__encrypted_update__cleartext_metadata():
+    """With /EncryptMetadata false, an updated XMP metadata stream is not encrypted."""
+    source = RESOURCE_ROOT / "encryption" / "r6-cleartext-metadata.pdf"
+    original = source.read_bytes()
+    writer = PdfWriter(PdfReader(source, password="foo"), incremental=True)
+    xmp = XmpInformation.create()
+    xmp.dc_title = {"x-default": "Cleartext title"}
+    writer.xmp_metadata = xmp
+    writer.add_metadata({"/Title": "Secret title"})
+    output = BytesIO()
+    writer.write(output)
+    data = output.getvalue()
+
+    assert data.startswith(original)
+    assert b"Cleartext title" in data[len(original):]
+    assert b"Secret title" not in data
+    reader = PdfReader(BytesIO(data), password="foo")
+    assert reader.xmp_metadata.dc_title == {"x-default": "Cleartext title"}
+    assert reader.metadata.title == "Secret title"
+
+
+def test_write__incremental__encrypted_update__direct_encrypt_dictionary():
+    """An /Encrypt dictionary given directly in the trailer is repeated in the trailer of the update."""
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.encrypt("user", "owner", algorithm="RC4-128")
+    output = BytesIO()
+    writer.write(output)
+    reader = PdfReader(BytesIO(output.getvalue()))
+    reference = reader.trailer.raw_get("/Encrypt")
+    entry = BytesIO()
+    reader.get_object(reference).write_to_stream(entry)
+    original = output.getvalue().replace(f"/Encrypt {reference.idnum} 0 R".encode(), b"/Encrypt " + entry.getvalue())
+    assert not isinstance(PdfReader(BytesIO(original)).trailer.raw_get("/Encrypt"), IndirectObject)
+
+    writer = PdfWriter(PdfReader(BytesIO(original), password="user"), incremental=True)
+    writer.add_metadata({"/Title": "Secret title"})
+    output = BytesIO()
+    writer.write(output)
+    data = output.getvalue()
+
+    assert data.startswith(original)
+    assert b"Secret title" not in data
+    # pypdf also finds /Encrypt in the older trailer, other readers do not.
+    assert b"/Encrypt <<" in data[len(original):]
+    updated = PdfReader(BytesIO(data), password="user")
+    assert updated.metadata.title == "Secret title"

@@ -234,8 +234,9 @@ class PdfWriter(PdfDocCommon):
 
             When writing incrementally, the original document is written first and new/modified
             content is appended. To be used for signed document/forms to keep signature valid.
-            Encryption is not supported in this mode: calling ``encrypt`` or writing changes to an
-            encrypted document raises a ``NotImplementedError``.
+            Changes to an encrypted document are encrypted with the key of the document, so pass a
+            reader that has been decrypted. Calling ``encrypt`` in this mode raises a
+            ``NotImplementedError``.
 
         full: If true, loads all the objects (always full if incremental = True).
             This parameter may allow loading large PDFs.
@@ -1479,10 +1480,6 @@ class PdfWriter(PdfDocCommon):
         if self.incremental:
             assert self._reader is not None, "mypy"
             has_increment = len(self.list_objects_in_increment()) > 0
-            if has_increment and self._reader.is_encrypted:
-                raise NotImplementedError(
-                    "Writing incremental updates of encrypted PDF files is currently not supported."
-                )
             self._reader.stream.seek(0)
             stream.write(self._reader.stream.read(-1))
             if has_increment:
@@ -1553,8 +1550,21 @@ class PdfWriter(PdfDocCommon):
     def _write_increment(self, stream: StreamType) -> None:
         # Only reached from `write()` inside `if self.incremental`.
         assert self._reader is not None, "mypy"
-        if self._reader.is_encrypted:
-            raise NotImplementedError("Writing incremental updates of encrypted PDF files is currently not supported.")
+        # Encrypt the update with the key of the document. A decrypted reader
+        # has the key.
+        encryption = self._reader._encryption
+        encrypt_reference: PdfObject | None = None
+        cleartext_ids = set()
+        if encryption is not None:
+            encrypt_reference = self._reader.trailer.raw_get(TrailerKeys.ENCRYPT)
+            # The encryption dictionary itself is never encrypted.
+            if isinstance(encrypt_reference, IndirectObject):
+                cleartext_ids.add(encrypt_reference.idnum)
+            # Neither is the document-level metadata stream if /EncryptMetadata
+            # is false (ISO 32000-2, Table 21).
+            metadata_reference = self.root_object.raw_get("/Metadata") if "/Metadata" in self.root_object else None
+            if not encryption.EncryptMetadata and isinstance(metadata_reference, IndirectObject):
+                cleartext_ids.add(metadata_reference.idnum)
         object_positions = {}
         object_blocks = []
         current_start = -1
@@ -1570,6 +1580,8 @@ class PdfWriter(PdfDocCommon):
                 # first write new/modified object
                 object_positions[idnum] = stream.tell()
                 stream.write(f"{idnum} 0 obj\n".encode())
+                if encryption is not None and idnum not in cleartext_ids:
+                    obj = encryption.encrypt_object(obj, idnum, 0)
                 obj.write_to_stream(stream)
                 stream.write(b"\nendobj\n")
 
@@ -1596,7 +1608,7 @@ class PdfWriter(PdfDocCommon):
         else:
             object_blocks.append([xr_id, 1])
         stream.write(f"{xr_id} 0 obj".encode())
-        init_data = {
+        init_data: dict[Any, Any] = {
             NameObject("/Type"): NameObject("/XRef"),
             NameObject("/Size"): NumberObject(xr_id + 1),
             NameObject("/Root"): self.root_object.indirect_reference,
@@ -1617,6 +1629,8 @@ class PdfWriter(PdfDocCommon):
         init_data[NameObject(TrailerKeys.PREV)] = NumberObject(self._reader._startxref)
         if self._ID:
             init_data[NameObject(TrailerKeys.ID)] = self._ID
+        if encrypt_reference is not None:
+            init_data[NameObject(TrailerKeys.ENCRYPT)] = encrypt_reference
         xr = StreamObject.initialize_from_dictionary(init_data)
         xr.set_data(
             b"".join(

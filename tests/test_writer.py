@@ -4224,28 +4224,30 @@ def test_encrypt__incremental():
 
 def test_write__incremental__encrypted_source():
     reader = PdfReader(RESOURCE_ROOT / "encryption" / "r3-user-password.pdf", password="asdfzxcv")
+    original = reader.stream.getvalue()
     writer = PdfWriter(reader, incremental=True)
 
     # Without modifications, the original file is written as-is.
     output = BytesIO()
     writer.write(output)
-    assert output.getvalue() == reader.stream.getvalue()
+    assert output.getvalue() == original
 
+    # The update is encrypted with the key of the document.
     writer.add_metadata({"/Title": "Secret title"})
     output = BytesIO()
-    with pytest.raises(
-        NotImplementedError,
-        match=r"^Writing incremental updates of encrypted PDF files is currently not supported\.$",
-    ):
-        writer.write(output)
-    assert output.getvalue() == b""
+    writer.write(output)
+    data = output.getvalue()
+    assert data.startswith(original)
+    assert b"Secret title" not in data
 
-    with pytest.raises(
-        NotImplementedError,
-        match=r"^Writing incremental updates of encrypted PDF files is currently not supported\.$",
-    ):
-        writer._write_increment(output)
-    assert output.getvalue() == b""
+    # The trailer of the update refers to the same encryption dictionary.
+    encrypt_reference = re.search(rb"/Encrypt (\d+) 0 R", data[len(original):])
+    assert encrypt_reference is not None
+    assert int(encrypt_reference.group(1)) == reader.trailer.raw_get("/Encrypt").idnum
+
+    updated = PdfReader(BytesIO(data), password="asdfzxcv")
+    assert updated.metadata.title == "Secret title"
+    assert updated.pages[0].extract_text() == reader.pages[0].extract_text()
 
 
 @pytest.mark.parametrize("change_page", [True, False])

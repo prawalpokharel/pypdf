@@ -63,3 +63,23 @@ writer = PdfWriter(clone_from=reader)
 # Save the new PDF to a file
 writer.write("out-decrypt.pdf")
 ```
+
+## Change an encrypted PDF incrementally
+
+In incremental mode, the original file is kept byte for byte and only the changes are
+appended. For an encrypted PDF, the changes are encrypted with the key of the document,
+so the result opens with the same passwords:
+
+```{testcode}
+from pypdf import PdfReader, PdfWriter
+
+reader = PdfReader("encrypted-file.pdf", password="test")
+writer = PdfWriter(reader, incremental=True)
+
+writer.add_metadata({"/Title": "Updated title"})
+
+writer.write("out-incremental.pdf")
+```
+
+The reader has to be decrypted first. Changing the password or the algorithm with
+`encrypt` is not possible in incremental mode.
