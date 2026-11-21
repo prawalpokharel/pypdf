@@ -4248,6 +4248,70 @@ def test_write__incremental__encrypted_source():
     assert output.getvalue() == b""
 
 
+@pytest.mark.parametrize("change_page", [True, False])
+def test_write__incremental__trailer_of_update(change_page):
+    """
+    The cross-reference stream of an update lists itself, and the update repeats /Info.
+
+    Readers that only use the last trailer, such as qpdf, did not see /Info when it was unchanged.
+    """
+    source = RESOURCE_ROOT / "crazyones.pdf"
+    info_reference = PdfReader(source).trailer.raw_get("/Info")
+    writer = PdfWriter(source, incremental=True)
+    if change_page:
+        writer.pages[0][NameObject("/Rotate")] = NumberObject(90)
+    else:
+        writer.add_metadata({"/Title": "Changed title"})
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    # The object at startxref is the cross-reference stream of the update.
+    xref_stream_id = int(output.getvalue()[reader._startxref:].split(maxsplit=1)[0])
+    assert reader.xref[0][xref_stream_id] == reader._startxref
+    xref_stream = reader.get_object(xref_stream_id)
+    assert xref_stream["/Type"] == "/XRef"
+    assert xref_stream["/Size"] == xref_stream_id + 1
+    assert xref_stream.raw_get("/Info").idnum == info_reference.idnum
+
+
+def test_write__incremental__trailer_of_update__without_info():
+    """A document without /Info gets no /Info entry in the trailer of an update."""
+    writer = PdfWriter(RESOURCE_ROOT / "missing_info.pdf", incremental=True)
+    writer.pages[0][NameObject("/Rotate")] = NumberObject(90)
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    xref_stream = reader.get_object(int(output.getvalue()[reader._startxref:].split(maxsplit=1)[0]))
+    assert xref_stream["/Type"] == "/XRef"
+    assert "/Info" not in xref_stream
+    assert reader.pages[0]["/Rotate"] == 90
+
+
+def test_write__incremental__trailer_of_update__free_objects_at_end():
+    """/Size does not shrink when the previous section ends with free entries."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    for _ in range(5):
+        writer._add_object(NullObject())
+    writer._objects[-5:] = [None] * 5
+    source = BytesIO()
+    writer.write(source)
+    previous_size = PdfReader(source).trailer["/Size"]
+
+    writer = PdfWriter(PdfReader(source), incremental=True)
+    assert len(writer._objects) + 1 < previous_size
+    writer.pages[0][NameObject("/Rotate")] = NumberObject(90)
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output)
+    assert reader.xref[0][previous_size] == reader._startxref
+    assert reader.trailer["/Size"] == previous_size + 1
+    assert reader.pages[0]["/Rotate"] == 90
+
+
 @pytest.mark.timeout(5)
 def test_get_filtered_outline__first__cyclic(caplog) -> None:
     writer = PdfWriter()

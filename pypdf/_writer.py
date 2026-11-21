@@ -1585,7 +1585,16 @@ class PdfWriter(PdfDocCommon):
         object_blocks.append([current_start, current_stop - current_start])
         # write incremented xref
         xref_location = stream.tell()
-        xr_id = len(self._objects) + 1
+        # The object number of the cross-reference stream must not be below
+        # /Size of the previous trailer. Free entries at the end of the previous
+        # sections are not loaded, so len(self._objects) can be lower.
+        xr_id = max(len(self._objects) + 1, cast(int, self._reader.trailer[TrailerKeys.SIZE]))
+        # The cross-reference stream lists its own object as well.
+        object_positions[xr_id] = xref_location
+        if xr_id == current_stop:
+            object_blocks[-1][1] += 1
+        else:
+            object_blocks.append([xr_id, 1])
         stream.write(f"{xr_id} 0 obj".encode())
         init_data = {
             NameObject("/Type"): NameObject("/XRef"),
@@ -1600,14 +1609,10 @@ class PdfWriter(PdfDocCommon):
             ),
             "__streamdata__": b"",
         }
-        if self._info is not None and (
-            self._info.indirect_reference.idnum - 1  # type: ignore[union-attr]
-            >= len(self._original_hash)
-            or cast(IndirectObject, self._info).hash_bin()  # kept for future
-            != self._original_hash[
-                self._info.indirect_reference.idnum - 1  # type: ignore[union-attr]
-            ]
-        ):
+        # The trailer of an update has to repeat the entries of the previous
+        # trailer except /Prev (ISO 32000-1, 7.5.6). Readers that only use the
+        # last trailer would otherwise not see /Info when it was unchanged.
+        if self._info is not None:
             init_data[NameObject(TrailerKeys.INFO)] = self._info.indirect_reference
         init_data[NameObject(TrailerKeys.PREV)] = NumberObject(self._reader._startxref)
         if self._ID:
