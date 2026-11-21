@@ -16,7 +16,7 @@ from pypdf import PasswordType, PdfReader, PdfWriter
 from pypdf._crypt_providers import crypt_provider
 from pypdf._crypt_providers._fallback import _DEPENDENCY_ERROR_STR
 from pypdf._encryption import AlgV5, CryptAES, CryptRC4, EncryptAlgorithm, Encryption, _saslprep
-from pypdf.errors import DependencyError, PdfReadError, PdfStreamError, WrongPasswordError
+from pypdf.errors import DependencyError, FileNotDecryptedError, PdfReadError, PdfStreamError, WrongPasswordError
 from pypdf.generic import ByteStringObject, DictionaryObject, NameObject, NullObject, NumberObject
 from tests import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url
 
@@ -26,63 +26,74 @@ HAS_AES = USE_CRYPTOGRAPHY or USE_PYCRYPTODOME
 
 
 @pytest.mark.parametrize(
-    ("name", "requires_aes"),
+    ("name", "requires_aes", "password_type"),
     [
         # unencrypted pdf
-        ("unencrypted.pdf", False),
+        ("unencrypted.pdf", False, None),
         # created by:
         # qpdf --encrypt "" "" 40 -- unencrypted.pdf r2-empty-password.pdf
-        ("r2-empty-password.pdf", False),
+        ("r2-empty-password.pdf", False, PasswordType.NOT_DECRYPTED),
         # created by:
         # qpdf --encrypt "" "" 128 -- unencrypted.pdf r3-empty-password.pdf
-        ("r3-empty-password.pdf", False),
+        ("r3-empty-password.pdf", False, PasswordType.NOT_DECRYPTED),
+        # The R2 to R4 *-user-password files have an empty owner password, so the
+        # user password is also the owner password (ISO 32000-1, algorithm 3).
+        # pypdf checks the owner password first and returns OWNER_PASSWORD.
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 40 -- unencrypted.pdf r2-user-password.pdf
-        ("r2-user-password.pdf", False),
+        ("r2-user-password.pdf", False, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "asdfzxcv" 40 -- unencrypted.pdf r2-owner-password.pdf
-        ("r2-owner-password.pdf", False),
+        ("r2-owner-password.pdf", False, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 128 -- unencrypted.pdf r3-user-password.pdf
-        ("r3-user-password.pdf", False),
+        ("r3-user-password.pdf", False, PasswordType.OWNER_PASSWORD),
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --allow-weak-crypto --encrypt "" "asdfzxcv" 128 -- unencrypted.pdf r3-owner-password.pdf
+        ("r3-owner-password.pdf", False, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 128 --force-V4 -- unencrypted.pdf r4-user-password.pdf
-        ("r4-user-password.pdf", False),
+        ("r4-user-password.pdf", False, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "asdfzxcv" 128 --force-V4 -- unencrypted.pdf r4-owner-password.pdf
-        ("r4-owner-password.pdf", False),
+        ("r4-owner-password.pdf", False, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 128 --use-aes=y -- unencrypted.pdf r4-aes-user-password.pdf
-        ("r4-aes-user-password.pdf", True),
+        ("r4-aes-user-password.pdf", True, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "" 256 --force-R5 -- unencrypted.pdf r5-empty-password.pdf
-        ("r5-empty-password.pdf", True),
+        ("r5-empty-password.pdf", True, PasswordType.NOT_DECRYPTED),
+        # The R5 and R6 *-user-password files have the empty string as owner
+        # password, so "asdfzxcv" only matches the user password.
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 256 --force-R5 -- unencrypted.pdf r5-user-password.pdf
-        ("r5-user-password.pdf", True),
+        ("r5-user-password.pdf", True, PasswordType.USER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "asdfzxcv" 256 --force-R5 -- unencrypted.pdf r5-owner-password.pdf
-        ("r5-owner-password.pdf", True),
+        ("r5-owner-password.pdf", True, PasswordType.OWNER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "" 256 -- unencrypted.pdf r6-empty-password.pdf
-        ("r6-empty-password.pdf", True),
+        ("r6-empty-password.pdf", True, PasswordType.NOT_DECRYPTED),
         # created by:
         # qpdf --encrypt "asdfzxcv" "" 256 -- unencrypted.pdf r6-user-password.pdf
-        ("r6-user-password.pdf", True),
+        ("r6-user-password.pdf", True, PasswordType.USER_PASSWORD),
         # created by:
         # qpdf --encrypt "" "asdfzxcv" 256 -- unencrypted.pdf r6-owner-password.pdf
-        ("r6-owner-password.pdf", True),
+        ("r6-owner-password.pdf", True, PasswordType.OWNER_PASSWORD),
     ],
 )
-def test_encryption(name, requires_aes):
+def test_encryption(name, requires_aes, password_type):
     """
     Encrypted PDFs are handled correctly.
 
     This test function ensures that:
     - If PyCryptodome or cryptography is not available and required, a DependencyError is raised
     - Encrypted PDFs are identified correctly
-    - Decryption works for encrypted PDFs
+    - Decrypting with "asdfzxcv" returns the expected password type
     - Metadata is properly extracted from the decrypted PDF
+
+    Some files open with the empty password, so reading them does not show whether
+    "asdfzxcv" was verified. Only the returned password type does.
     """
     inputfile = RESOURCE_ROOT / "encryption" / name
     if requires_aes and not HAS_AES:
@@ -97,7 +108,7 @@ def test_encryption(name, requires_aes):
         assert not ipdf.is_encrypted
     else:
         assert ipdf.is_encrypted
-        ipdf.decrypt("asdfzxcv")
+        assert ipdf.decrypt("asdfzxcv") == password_type
     assert len(ipdf.pages) == 1
     dd = dict(ipdf.metadata)
     # remove empty value entry
@@ -113,15 +124,29 @@ def test_encryption(name, requires_aes):
 
 
 @pytest.mark.parametrize(
-    ("name", "user_passwd", "owner_passwd"),
+    ("name", "user_passwd", "owner_passwd", "requires_aes"),
     [
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --allow-weak-crypto --encrypt "foo" "bar" 40 -- unencrypted.pdf r2-both-passwords.pdf
+        ("r2-both-passwords.pdf", "foo", "bar", False),
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --allow-weak-crypto --encrypt "foo" "bar" 128 -- unencrypted.pdf r3-both-passwords.pdf
+        ("r3-both-passwords.pdf", "foo", "bar", False),
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --allow-weak-crypto --encrypt "foo" "bar" 128 --force-V4 -- unencrypted.pdf r4-both-passwords.pdf
+        ("r4-both-passwords.pdf", "foo", "bar", False),
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --encrypt "foo" "bar" 128 --use-aes=y -- unencrypted.pdf r4-aes-both-passwords.pdf
+        ("r4-aes-both-passwords.pdf", "foo", "bar", True),
+        # created by qpdf 12.4.2, run through pikepdf.Job:
+        # qpdf --encrypt "foo" "bar" 256 --force-R5 -- unencrypted.pdf r5-both-passwords.pdf
+        ("r5-both-passwords.pdf", "foo", "bar", True),
         # created by
         # qpdf --encrypt "foo" "bar" 256 -- unencrypted.pdf r6-both-passwords.pdf
-        ("r6-both-passwords.pdf", "foo", "bar"),
+        ("r6-both-passwords.pdf", "foo", "bar", True),
     ],
 )
-@pytest.mark.skipif(not HAS_AES, reason="No AES implementation")
-def test_pdf_with_both_passwords(name, user_passwd, owner_passwd):
+def test_pdf_with_both_passwords(name, user_passwd, owner_passwd, requires_aes):
     """
     PDFs with both user and owner passwords are handled correctly.
 
@@ -129,14 +154,31 @@ def test_pdf_with_both_passwords(name, user_passwd, owner_passwd):
     - Encrypted PDFs with both user and owner passwords are identified correctly
     - Decryption works for both user and owner passwords
     - The correct password type is returned after decryption
-    - The number of pages is correctly identified after decryption
+    - The number of pages, the metadata and the text are readable after decryption
+    - A wrong or empty password does not decrypt the file
+
+    Each password gets its own reader. The user password is not empty, so a broken
+    owner password check cannot pass by falling back to an empty user password.
     """
+    if requires_aes and not HAS_AES:
+        pytest.skip("No AES implementation")
     inputfile = RESOURCE_ROOT / "encryption" / name
-    ipdf = pypdf.PdfReader(inputfile)
-    assert ipdf.is_encrypted
-    assert ipdf.decrypt(user_passwd) == PasswordType.USER_PASSWORD
-    assert ipdf.decrypt(owner_passwd) == PasswordType.OWNER_PASSWORD
-    assert len(ipdf.pages) == 1
+    for password, password_type in (
+        (user_passwd, PasswordType.USER_PASSWORD),
+        (owner_passwd, PasswordType.OWNER_PASSWORD),
+    ):
+        ipdf = pypdf.PdfReader(inputfile)
+        assert ipdf.is_encrypted
+        assert ipdf.decrypt(password) == password_type
+        assert len(ipdf.pages) == 1
+        assert ipdf.metadata["/Author"] == "cheng"
+        assert "pdf encryption test" in ipdf.pages[0].extract_text()
+
+    for password in ("wrong", ""):
+        ipdf = pypdf.PdfReader(inputfile)
+        assert ipdf.decrypt(password) == PasswordType.NOT_DECRYPTED
+        with pytest.raises(FileNotDecryptedError):
+            len(ipdf.pages)
 
 
 @pytest.mark.skipif(not HAS_AES, reason="No AES implementation")
